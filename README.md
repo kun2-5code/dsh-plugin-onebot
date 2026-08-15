@@ -202,7 +202,15 @@ pnpm dsh plugin --profile web add /absolute/path/to/dsh-plugin-onebot && pnpm ds
 
 - **npm**：`pnpm publish`（`files` 已包含构建产物与补丁）
 - **tarball**：`pnpm pack`，用户 `dsh plugin --profile demo add ./dsh-plugin-onebot-0.1.0.tgz`
-- **git**：`dsh plugin add github:you/dsh-plugin-onebot`（pnpm ≥10 首次安装 git 依赖会拒绝执行 prepare，按提示把包名加入 profile 的 `pnpm-workspace.yaml` 的 `allowBuilds` 后重试）
+- **git**：`dsh plugin add github:you/dsh-plugin-onebot`。pnpm ≥10/11 对 git 依赖的 `prepare` 构建脚本有白名单限制，首次安装会报 `ERR_PNPM_GIT_DEP_PREPARE_NOT_ALLOWED`，需要把该仓库加进 profile 的 `pnpm-workspace.yaml` 的 `allowBuilds`——**用 git 仓库键（任何 commit 都匹配，不用跟着哈希改）**：
+
+  ```yaml
+  allowBuilds:
+    dsh-plugin-onebot@git+https://github.com/you/dsh-plugin-onebot.git: true
+  ```
+
+  注意：裸包名（`dsh-plugin-onebot: true`）对 git 依赖**不生效**，pnpm 只会匹配精确的
+  `name@<tarball-url>` 键或上面的 `name@git+<repo>.git` 仓库键。
 
 ## 相关文档
 
