@@ -1,78 +1,203 @@
 /**
- * dsh-plugin-template 主插件：一个可直接运行的示例，演示 dsh 插件最常用的四种形态——
- * 配置（Config + Schemastery 校验）、工具注册（defineTool）、事件监听（ctx.on）、
- * 显式资源清理（ctx.effect）。
+ * dsh-plugin-onebot 主插件：DeepSeek Harness 任务完成后，通过 OneBot
+ * （NapCat / go-cqhttp / Lagrange 等）通知指定 QQ 用户或群组。
+ *
+ * - 连接：WS 长连接（默认 server 模式，插件作为 WS 服务端等 NapCat 反向 WS 接入，
+ *   也可 client 模式主动连接，或 off 关闭）；HTTP 调用 OneBot API 执行发送行为。
+ * - 触发：默认监听 agent/status（agent 转为 idle = 整个任务完成）通知一次；
+ *   可切换 notifyOn: 'turn' 监听 session/event 的 turn/end 逐回合通知。
+ * - 工具：注册 notify_onebot，让模型在任务过程中/结尾主动给指定用户或群发消息。
  *
  * 加载契约：模块具名导出 apply(ctx, config)；框架在依赖（inject）就绪后调用 apply，
- * 卸载时自动回收所有通过 ctx 注册的监听器与 effect，无需手动移除。
- * @module dsh-plugin-template
+ * 卸载时自动回收所有通过 ctx 注册的监听器与 effect。
+ * @module dsh-plugin-onebot
  */
 
 import type { Context } from '@deepseek-ai/cordis'
 import Schema from '@deepseek-ai/schemastery'
 import { defineTool } from '@deepseek-ai/dsh-tools'
+import type { Session } from '@deepseek-ai/dsh-session'
+import { OneBotService } from './service'
+import { renderTemplate, summarizeSession, truncate, type CompletionStatus } from './notify'
+import type { HttpConfig, NotifyConfig, OneBotTarget, WsConfig } from './types'
+
+export type { HttpConfig, NotifyConfig, OneBotTarget, WsConfig } from './types'
+export { renderTemplate, summarizeSession, truncate, extractAssistantText, type CompletionStatus } from './notify'
 
 /** 插件显示名（诊断日志中使用）。 */
-export const name = 'dsh-plugin-template'
+export const name = 'dsh-plugin-onebot'
 
 /** 依赖的服务：tools 就绪后本插件才会加载。 */
 export const inject = ['tools']
 
 /** 插件配置：部署时通过 cordis.yml 覆盖，不要把可调值硬编码进代码。 */
 export interface Config {
-  /** 打招呼的前缀文案。 */
-  greeting: string
-  /** 示例重试次数。 */
-  maxRetries: number
-  /** 是否打印调试日志。 */
-  verbose?: boolean
+  http: HttpConfig
+  ws: WsConfig
+  notify: NotifyConfig
 }
 
-/** Schemastery 配置 schema：负责校验与默认值，配置非法时加载响亮失败。 */
+/** Schemastery 配置 schema：校验 + 默认值，配置非法时加载响亮失败。 */
 export const Config: Schema<Config> = Schema.object({
-  greeting: Schema.string().default('Hello'),
-  maxRetries: Schema.number().default(3),
-  verbose: Schema.boolean().default(false),
+  http: Schema.object({
+    url: Schema.string()
+      .description('OneBot HTTP API 根地址（NapCat 默认 http://127.0.0.1:3000）')
+      .default('http://127.0.0.1:3000'),
+    token: Schema.string().description('HTTP API 访问令牌（Authorization: Bearer），留空则不携带').default(''),
+    timeoutMs: Schema.natural().description('单次请求超时（毫秒）').default(10_000),
+  }),
+  ws: Schema.object({
+    mode: Schema.union(['server', 'client', 'off'])
+      .description('server：插件作为 WS 服务端等 NapCat 反向 WS 接入（推荐）；client：主动连接正向 WS；off：关闭长连接')
+      .default('server'),
+    host: Schema.string()
+      .description('server 模式监听地址（0.0.0.0 表示所有网卡）；client 模式为 NapCat 地址')
+      .default('0.0.0.0'),
+    port: Schema.natural().description('server 模式监听端口；client 模式为 NapCat 端口').default(8080),
+    path: Schema.string().description('WS 路径').default('/ws'),
+    token: Schema.string()
+      .description('WS 鉴权令牌（server 模式校验接入方；client 模式作为 Authorization 头发送），留空则不鉴权')
+      .default(''),
+    reconnectInterval: Schema.natural().description('断线重连间隔（毫秒），仅 client 模式').default(3000),
+  }),
+  notify: Schema.object({
+    notifyOn: Schema.union(['idle', 'turn'])
+      .description('idle：agent 整体转为空闲（整个任务完成）时通知；turn：每个完成/出错的回合结束时通知')
+      .default('idle'),
+    onError: Schema.boolean().description('出错（回合 reason 为 error）时也通知').default(true),
+    includeSubagents: Schema.boolean()
+      .description('是否包含子 agent（subagent）的完成事件；默认只通知顶层 agent')
+      .default(false),
+    targets: Schema.array(Schema.object({
+      type: Schema.union(['private', 'group']).default('private'),
+      id: Schema.string().default(''),
+    })).description('默认通知目标列表').default([]),
+    template: Schema.string()
+      .description('消息模板，占位符：{sessionId} {summary} {status} {time}')
+      .default('【任务完成】\n会话: {sessionId}\n状态: {status}\n\n{summary}'),
+    maxLength: Schema.natural().description('渲染后消息最大长度，超出截断').default(2000),
+    retries: Schema.natural().description('HTTP 发送失败重试次数（指数退避）').default(3),
+    retryDelayMs: Schema.natural().description('重试基础延迟（毫秒）').default(1000),
+    verbose: Schema.boolean().description('是否打印调试日志').default(false),
+  }),
 })
 
-/**
- * 类型化事件声明（declaration merging）：声明后 ctx.on / ctx.emit 自动获得类型推导。
- * 事件名遵循 namespace/action 约定。
- */
-declare module '@deepseek-ai/cordis' {
-  interface Events {
-    'my-plugin/ready': (payload: { id: string }) => void
+/** 是否跳过子 agent 会话（origin 为 subagent 或 delegationDepth > 0）。 */
+function isSubagent(session: Session): boolean {
+  return session.header.origin === 'subagent' || (session.header.delegationDepth ?? 0) > 0
+}
+
+/** 取会话最后一条 turn/end 的原因；没有则返回 undefined。 */
+function lastTurnEndReason(session: Session): CompletionStatus | undefined {
+  const events = session.events
+  for (let index = events.length - 1; index >= 0; index--) {
+    const event = events[index]
+    if (event && event.type === 'turn/end') return event.data.reason.kind
+  }
+  return undefined
+}
+
+/** 向所有默认目标发送一条通知（逐个目标容错，失败仅记录）。 */
+async function sendNotifications(onebot: OneBotService, config: Config, message: string): Promise<void> {
+  if (config.notify.targets.length === 0) {
+    if (config.notify.verbose) console.log(`[${name}] no targets configured, skip notification`)
+    return
+  }
+  for (const target of config.notify.targets) {
+    try {
+      await onebot.sendMsg(target, message)
+      if (config.notify.verbose) console.log(`[${name}] notified ${target.type}:${target.id}`)
+    } catch (error) {
+      console.error(`[${name}] failed to notify ${target.type}:${target.id}: ${(error as Error).message}`)
+    }
   }
 }
 
 /** 插件主体：所有注册都是 effect，随插件卸载自动回收。 */
 export function apply(ctx: Context, config: Config): void {
-  // 1) 注册一个模型可调用的工具。output.render 是纯函数，把规范输出转成模型可见内容。
+  const onebot = new OneBotService(ctx, config)
+
+  // 1) WS 长连接生命周期（start 后由 ctx.effect 在卸载时 stop）。
+  ctx.effect(() => {
+    onebot.start()
+    return () => onebot.stop()
+  })
+
+  // 2) 任务完成自动通知。
+  if (config.notify.notifyOn === 'idle') {
+    // 只在 agent 真正运行过（running→idle）后通知，避免启动即 idle 的误报。
+    const ran = new Set<object>()
+    ctx.on('agent/status', ({ agent, status }) => {
+      if (status === 'running') {
+        ran.add(agent)
+        return
+      }
+      if (!ran.delete(agent)) return
+      const session = agent.session
+      const reason = lastTurnEndReason(session)
+      if (reason !== 'completed' && !(config.notify.onError && reason === 'error')) return
+      if (!config.notify.includeSubagents && isSubagent(session)) return
+      const message = truncate(renderTemplate(config.notify.template, {
+        sessionId: session.id,
+        status: reason,
+        summary: summarizeSession(session) || '（无文本输出）',
+        time: Date.now(),
+      }), config.notify.maxLength)
+      void sendNotifications(onebot, config, message)
+    })
+  } else {
+    // turn 模式：每个完成/出错的回合结束都通知。
+    ctx.on('session/event', (session, event) => {
+      if (event.type !== 'turn/end') return
+      const reason = event.data.reason.kind
+      if (reason !== 'completed' && !(config.notify.onError && reason === 'error')) return
+      if (!config.notify.includeSubagents && isSubagent(session)) return
+      const message = truncate(renderTemplate(config.notify.template, {
+        sessionId: session.id,
+        status: reason,
+        summary: summarizeSession(session) || '（无文本输出）',
+        time: event.time,
+      }), config.notify.maxLength)
+      void sendNotifications(onebot, config, message)
+    })
+  }
+
+  // 3) 模型可主动调用的通知工具。
   ctx.tools.register(defineTool({
-    name: 'greet',
-    description: 'Greet someone by name.',
+    name: 'notify_onebot',
+    description: 'Send a message to a OneBot user or group (QQ). Use when the task completes and the result should be pushed to a specific person or group, or when the user asks to message them. Message supports CQ codes like [CQ:at,qq=123].',
     parameters: {
-      name: { type: 'string', required: true, description: 'The name to greet' },
+      message: { type: 'string', required: true, description: 'The message content to send (supports CQ codes).' },
+      targetType: {
+        type: 'string',
+        enum: ['private', 'group'],
+        description: 'Target type. Omit together with targetId to use the configured default targets.',
+      },
+      targetId: {
+        type: 'string',
+        description: 'QQ number (private) or group number (group). Pair with targetType.',
+      },
     },
     output: {
       schema: { type: 'string' },
       render: (_args, value) => [{ type: 'text', text: value }],
     },
     async execute(args) {
-      return `${config.greeting}, ${args.name}!`
+      const targets: OneBotTarget[] =
+        args.targetType !== undefined && args.targetId !== undefined
+          ? [{ type: args.targetType, id: args.targetId }]
+          : config.notify.targets
+      if (targets.length === 0) return '未配置任何通知目标'
+      const results: string[] = []
+      for (const target of targets) {
+        try {
+          const res = await onebot.sendMsg(target, args.message)
+          results.push(`${target.type}:${target.id} → ok(retcode=${res.retcode})`)
+        } catch (error) {
+          results.push(`${target.type}:${target.id} → 失败: ${(error as Error).message}`)
+        }
+      }
+      return results.join('\n')
     },
   }))
-
-  // 2) 事件监听：同样是 effect，插件卸载时自动移除。
-  ctx.on('my-plugin/ready', ({ id }) => {
-    if (config.verbose) console.log(`[${name}] ${id} is ready`)
-  })
-
-  // 3) 需要显式清理的资源（网络连接、定时器等）用 ctx.effect 提供 disposer。
-  ctx.effect(() => {
-    const timer = setInterval(() => {
-      if (config.verbose) console.log(`[${name}] heartbeat (maxRetries=${config.maxRetries})`)
-    }, 60_000)
-    return () => clearInterval(timer)
-  })
 }

@@ -1,7 +1,7 @@
 {
-  "name": "dsh-plugin-template",
+  "name": "dsh-plugin-onebot",
   "version": "0.1.0",
-  "description": "A starter template for DeepSeek Harness (dsh) plugins: config + tool + events + service in one installable bundle.",
+  "description": "DeepSeek Harness (dsh) plugin: notify OneBot users/groups when a task completes, via WS long-connection (server mode) + OneBot HTTP API actions.",
   "type": "module",
   "main": "lib/index.js",
   "types": "lib/index.d.ts",
@@ -14,20 +14,14 @@
       "types": "./lib/service.d.ts",
       "default": "./lib/service.js"
     },
-    "./hook": {
-      "types": "./lib/hook.d.ts",
-      "default": "./lib/hook.js"
-    },
     "./cordis.patch.yml": "./cordis.patch.yml",
     "./package.json": "./package.json"
   },
   "files": [
     "lib/index.js",
     "lib/service.js",
-    "lib/hook.js",
     "lib/index.d.ts",
     "lib/service.d.ts",
-    "lib/hook.d.ts",
     "cordis.patch.yml"
   ],
   "dsh": {
@@ -47,12 +41,14 @@
     "deepseek-harness",
     "dsh",
     "cordis",
-    "plugin",
-    "template"
+    "onebot",
+    "napcat",
+    "plugin"
   ],
   "license": "MIT",
   "dependencies": {
-    "@deepseek-ai/schemastery": "^3.18.1"
+    "@deepseek-ai/schemastery": "^3.18.1",
+    "ws": "^8.18.3"
   },
   "peerDependencies": {
     "@deepseek-ai/cordis": "^4.0.1",
@@ -60,8 +56,12 @@
   },
   "devDependencies": {
     "@deepseek-ai/cordis": "^4.0.1",
+    "@deepseek-ai/dsh-agent": "0.1.0-rc.6",
+    "@deepseek-ai/dsh-llm": "0.1.0-rc.6",
+    "@deepseek-ai/dsh-session": "0.1.0-rc.6",
     "@deepseek-ai/dsh-tools": "^0.1.0-rc.6",
     "@types/node": "^22.20.0",
+    "@types/ws": "^8.18.1",
     "tsdown": "^0.22.2",
     "typescript": "^6.0.3"
   }

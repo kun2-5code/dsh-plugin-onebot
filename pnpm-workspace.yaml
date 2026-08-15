@@ -1,0 +1,7 @@
+# 该插件仓库独立于上层 deepseek-harness monorepo 工作区：
+# 声明自身为唯一包，pnpm 以本目录为 workspace root 使用本地 pnpm-lock.yaml 安装。
+packages:
+  - .
+# pnpm >=10 默认拒绝带 install/build 脚本的依赖，按需放行。
+allowBuilds:
+  esbuild: true

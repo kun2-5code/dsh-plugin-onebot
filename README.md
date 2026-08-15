@@ -1,72 +1,113 @@
-# dsh-plugin-template
+# dsh-plugin-onebot
 
-DeepSeek Harness（`dsh`）插件模板：一个可直接运行、可直接安装的最小插件包，演示插件最常用的四种形态：
+DeepSeek Harness（`dsh`）插件：**任务完成后，通过 OneBot（NapCat / go-cqhttp / Lagrange 等）通知指定的 QQ 用户或群组**。
 
-- **配置**：`Config` 接口 + Schemastery schema，校验与默认值在加载时生效（[文档](https://github.com/deepseek-ai/deepseek-harness/blob/main/docs/user/develop/basic/config.zh.md)）
-- **工具**：`ctx.tools.register(defineTool(...))` 注册模型可调用的工具（[文档](https://github.com/deepseek-ai/deepseek-harness/blob/main/docs/user/develop/basic/tool.zh.md)）
-- **事件**：`ctx.on` / `ctx.emit` + declaration merging 类型化事件（[文档](https://github.com/deepseek-ai/deepseek-harness/blob/main/docs/user/develop/framework/events.zh.md)）
-- **Service**：类形式插件，为其他插件提供服务（[文档](https://github.com/deepseek-ai/deepseek-harness/blob/main/docs/user/develop/framework/service.zh.md)）
-- **Hook**：`tools/pre-execute` 权限门示例，按配置拒绝工具调用（[文档](https://github.com/deepseek-ai/deepseek-harness/blob/main/docs/cookbook/extension-cookbook.zh.md)）
+采用「**WS 长连接 + HTTP 执行行为**」的 OneBot 接入方式：
 
-本模板按官方 [bundle 分发模型](https://github.com/deepseek-ai/deepseek-harness/blob/main/docs/user/develop/basic/publish.zh.md) 组织：包内声明 `dsh.bundle` 与 `cordis.patch.yml`，用户 `dsh plugin add` 后即作为配置层生效。
+- **WS 长连接**（默认 `server` 模式）：插件作为 WebSocket 服务端，等 NapCat 的「反向 WebSocket 客户端」接入，用于接收事件、心跳探活、判断机器人是否在线；也可切换 `client` 模式主动连接，或 `off` 关闭。
+- **HTTP 执行行为**：调用 OneBot v11 HTTP API（`send_private_msg` / `send_group_msg` / `send_msg` 等）实际发送通知，支持 `Authorization: Bearer` 鉴权、超时与指数退避重试。
 
-## 目录结构
+## 特性
 
+- 任务完成自动通知：默认监听 `agent/status`（agent 转为 `idle` = 整个任务干完）通知一次；可切换 `notifyOn: 'turn'` 逐回合通知。
+- 只通知完成/出错结果（`notify.onError` 控制是否通知出错），默认跳过子 agent（subagent）避免重复通知。
+- 通知模板：支持 `{sessionId}` `{summary}` `{status}` `{time}` 占位符；摘要自动取最后一条 assistant 文本并按 `maxLength` 截断。
+- 模型可主动调用 `notify_onebot` 工具，把结果推给指定用户/群，支持 CQ 码（如 `[CQ:at,qq=123]`）。
+- 以 Service（`ctx.onebot`）形式提供，其他插件可复用。
+
+## 架构
+
+```mermaid
+flowchart LR
+    subgraph dsh["DeepSeek Harness (dsh)"]
+        P["dsh-plugin-onebot"]
+        P -->|"ctx.on('agent/status' / 'session/event')"| EV["任务完成信号"]
+        EV --> N["通知调度器<br/>摘要 + 模板渲染 + 截断"]
+        N --> C["OneBotService (ctx.onebot)"]
+        C -->|"HTTP POST /send_private_msg|send_group_msg"| H["NapCat HTTP API"]
+        C -->|"WS 长连接 接收事件/探活"| W["NapCat 反向 WS 客户端"]
+        P -->|"defineTool: notify_onebot"| M["模型主动发消息"]
+    end
 ```
-dsh-plugin-template/
-├── package.json        # npm 包清单 + dsh.bundle 声明 + prepare 构建脚本
-├── tsconfig.json       # 严格模式类型检查配置（tsc --noEmit）
-├── tsdown.config.ts    # 构建配置（ESM，输出 lib/，自包含，供 git 安装时 prepare 使用）
-├── cordis.patch.yml    # bundle 配置层：插入插件行
-├── dev/cordis.yml      # 本地开发 overlay（指向源码，配合 dsh web --patch）
-├── src/
-│   ├── index.ts        # 主插件：Config + 工具 + 事件 + effect
-│   ├── service.ts      # 可选示例：Service 提供方（默认注释启用）
-│   └── hook.ts         # 可选示例：hook 权限门（默认注释启用）
-└── test/smoke.mjs      # 构建产物冒烟测试
-```
 
-## 快速开始
-
-### 作为 bundle 安装（给用户用）
-
-在任意目录，把本包（或你 fork 后的仓库）装进 dsh profile：
+## 安装
 
 ```sh
 # 本地目录
-dsh plugin --profile demo add /path/to/dsh-plugin-template
+dsh plugin --profile demo add /path/to/dsh-plugin-onebot
 
-# 或直接从 GitHub 安装（模板 fork 后替换为你自己的仓库）
-dsh plugin --profile demo add github:you/dsh-plugin-template
+# 或从 GitHub 安装（会拉源码并自动构建 lib/）
+dsh plugin --profile demo add github:you/dsh-plugin-onebot
 ```
 
-GitHub 安装拉取的是**源码**，pnpm 会运行 `prepare`（即 `tsdown`）构建 `lib/`；pnpm ≥10 首次会拒绝执行 git 依赖的 prepare，把 pnpm 打印的包名加进 profile 的 `pnpm-workspace.yaml` 后重试：
-
-```yaml
-allowBuilds:
-  dsh-plugin-template: true
-```
-
-> 该 allowlist 相当于授权在安装时执行该包的代码，只应允许你信任的源码，并建议锁定 commit：`github:you/dsh-plugin-template#<sha>`。
-
-验证配置层并启动：
+安装后验证配置层并启动：
 
 ```sh
-dsh --profile demo --dump-config   # 应看到 "# == dsh-plugin-template" 层
+dsh --profile demo --dump-config   # 应看到 "# == dsh-plugin-onebot" 层
 dsh --profile demo
 ```
 
-### 本地开发（改插件）
+## NapCat 配置
 
-在 [deepseek-harness](https://github.com/deepseek-ai/deepseek-harness) 源码根目录，用 overlay 直接加载本仓库源码（免安装、免构建）：
+在 NapCat WebUI 的「网络配置」中：
 
-```sh
-pnpm dsh web --patch /absolute/path/to/dsh-plugin-template/dev/cordis.yml
+1. **HTTP 服务器**：开启。默认端口 `3000`（与插件 `http.url` 保持一致）。若设置了 token，记下来填到插件 `http.token`。
+2. **WebSocket 客户端（反向 WS）**：新建一条，类型选「WebSocket 客户端 / 反向 WebSocket 客户端」：
+   - 地址：`ws://<dsh 所在机器 IP>:8080/ws`（与插件 `ws.port` / `ws.path` 保持一致；dsh 与 NapCat 同机可用 `127.0.0.1`）
+   - token：与插件 `ws.token` 保持一致（留空则都不鉴权）
+   - 保存并启用后，日志应显示「反向 WebSocket 已连接」；插件侧 `verbose: true` 时也会打印 `WS client connected`。
+
+## dsh 配置
+
+安装后，在 profile 的 `cordis.yml` 里覆盖默认配置（不写则用默认值）：
+
+```yaml
+plugins:
+  dsh-plugin-onebot:
+    http:
+      url: http://127.0.0.1:3000   # NapCat HTTP API 地址
+      token: ''                     # 与 NapCat HTTP token 一致；留空不携带
+      timeoutMs: 10000
+    ws:
+      mode: server                  # server | client | off
+      host: 0.0.0.0                 # server 模式监听地址
+      port: 8080                    # server 模式监听端口
+      path: /ws                     # WS 路径，NapCat 反向 WS 地址要一致
+      token: ''                     # 与 NapCat 反向 WS token 一致；留空不鉴权
+      reconnectInterval: 3000       # 仅 client 模式断线重连间隔(ms)
+    notify:
+      notifyOn: idle                # idle：整个任务完成通知一次；turn：逐回合通知
+      onError: true                 # 出错时也通知
+      includeSubagents: false       # 是否包含子 agent 完成事件
+      targets:                      # 默认通知目标
+        - type: private             # private = QQ 号
+          id: '10001'
+        - type: group               # group = 群号
+          id: '20002'
+      template: '【任务完成】\n会话: {sessionId}\n状态: {status}\n\n{summary}'
+      maxLength: 2000
+      retries: 3                    # HTTP 失败重试次数（指数退避）
+      retryDelayMs: 1000
+      verbose: false                # 调试日志
 ```
 
-把 `dev/cordis.yml` 里的 `name` 改成这个仓库在你机器上的绝对路径，然后打开 `http://127.0.0.1:3080` 让模型调用 `greet` 工具试试。
+> 注意：`targets` 为空时自动通知会跳过（避免误发），但 `notify_onebot` 工具仍可用显式 `targetId` 发送。
 
-开发循环内自己跑检查：
+## notify_onebot 工具
+
+任务过程中/结尾，模型可主动调用：
+
+```json
+{
+  "message": "任务完成，结果见附件 [CQ:at,qq=10001]",
+  "targetType": "group",
+  "targetId": "20002"
+}
+```
+
+`targetType` / `targetId` 可省略，省略时发给配置的默认目标。
+
+## 本地开发
 
 ```sh
 pnpm install
@@ -75,28 +116,23 @@ pnpm build
 node test/smoke.mjs
 ```
 
-## 改成你自己的插件
+在 deepseek-harness 源码根目录用 overlay 直接加载本仓库源码（免安装、免构建）：
 
-1. 改包名：`package.json` 的 `name`（npm 名，如 `dsh-my-plugin`）、`src/index.ts` 的 `name`、`cordis.patch.yml` 里的 `id` 与 `name` 三处保持一致；改 `./service` 子路径时同步改 `exports`/`files`。
-2. 改 `Config` 接口与 `Config` schema：任何两个部署希望设置不同的值都必须是配置字段（[设计原则](https://github.com/deepseek-ai/deepseek-harness/blob/main/docs/user/develop/basic/config.zh.md#设计原则)）。
-3. 在 `apply` 里注册你的工具：`ctx.tools.register(defineTool({...}))`，`execute` 返回 `output.schema` 声明的规范值，`output.render` 纯函数负责模型可见渲染（[工具参考](https://github.com/deepseek-ai/deepseek-harness/blob/main/docs/cookbook/adding-a-tool.zh.md)）。
-4. 需要为其他插件提供能力时，启用 `src/service.ts` 并在 `cordis.patch.yml` 里取消对应行注释。
-5. 记得 `declare module '@deepseek-ai/cordis'` 合并 `Context` / `Events` 类型，跨包边界才类型安全。
-6. 需要拦截工具调用、做权限门或响应系统钩子时，启用 `src/hook.ts`（取消 `cordis.patch.yml` 里对应行注释）：`ctx.on('tools/pre-execute', ...)` 返回 `{ kind: 'deny', reason }` 或调用 `next()` 放行（[扩展插件形态](https://github.com/deepseek-ai/deepseek-harness/blob/main/docs/cookbook/extension-cookbook.zh.md)）。
+```sh
+pnpm dsh web --patch /absolute/path/to/dsh-plugin-onebot/dev/cordis.yml
+```
+
+（`dev/cordis.yml` 里的 `name` 是绝对路径，需改成你机器上的实际路径。）
 
 ## 发布
 
-- **npm**：`pnpm publish`（`files` 已包含构建产物与补丁，无需额外步骤）
-- **tarball**：`pnpm pack`，用户 `dsh plugin --profile demo add ./dsh-plugin-template-0.1.0.tgz`
-- **git**：用户 `dsh plugin add github:you/dsh-plugin-template`（配合上面的 `allowBuilds`）
+- **npm**：`pnpm publish`（`files` 已包含构建产物与补丁）
+- **tarball**：`pnpm pack`，用户 `dsh plugin --profile demo add ./dsh-plugin-onebot-0.1.0.tgz`
+- **git**：`dsh plugin add github:you/dsh-plugin-onebot`（pnpm ≥10 首次安装 git 依赖会拒绝执行 prepare，按提示把包名加入 profile 的 `pnpm-workspace.yaml` 的 `allowBuilds` 后重试）
 
 ## 相关文档
 
-- 插件开发入门：[basic/index.zh.md](https://github.com/deepseek-ai/deepseek-harness/blob/main/docs/user/develop/basic/index.zh.md)
-- 插件配置：[basic/config.zh.md](https://github.com/deepseek-ai/deepseek-harness/blob/main/docs/user/develop/basic/config.zh.md)
-- 工具开发：[basic/tool.zh.md](https://github.com/deepseek-ai/deepseek-harness/blob/main/docs/user/develop/basic/tool.zh.md)
-- 打包与安装：[basic/publish.zh.md](https://github.com/deepseek-ai/deepseek-harness/blob/main/docs/user/develop/basic/publish.zh.md)
-- 插件与生命周期：[framework/index.zh.md](https://github.com/deepseek-ai/deepseek-harness/blob/main/docs/user/develop/framework/index.zh.md)
-- 服务与依赖：[framework/service.zh.md](https://github.com/deepseek-ai/deepseek-harness/blob/main/docs/user/develop/framework/service.zh.md)
-- 事件系统：[framework/events.zh.md](https://github.com/deepseek-ai/deepseek-harness/blob/main/docs/user/develop/framework/events.zh.md)
-- Cordis 底层教程：[cordis-tutorial](https://github.com/deepseek-ai/deepseek-harness/blob/main/docs/cordis-tutorial/index.zh.md)
+- [插件开发入门](https://github.com/deepseek-ai/deepseek-harness/blob/main/docs/user/develop/basic/index.zh.md)
+- [插件配置](https://github.com/deepseek-ai/deepseek-harness/blob/main/docs/user/develop/basic/config.zh.md)
+- [事件系统](https://github.com/deepseek-ai/deepseek-harness/blob/main/docs/user/develop/framework/events.zh.md)
+- [OneBot v11 协议](https://github.com/botuniverse/onebot-11)
