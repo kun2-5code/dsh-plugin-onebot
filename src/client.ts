@@ -2,6 +2,10 @@
  * dsh-plugin-onebot 的浏览器半边（client plugin）：在 设置 → 插件 → Configurable
  * 里注册一张配置卡片，让 http / ws / notify 全部配置项可以在 GUI 里点击修改。
  *
+ * UI 结构与样式对齐 dsh-plugin-template 的 src/client.ts 与 harness 内置卡片
+ * （PluginCard / ValueField）：可折叠卡片头、字段上下堆叠（标签行 + 控件 + 提示）、
+ * 每段"已覆盖"徽标与重置、右下角 放弃/保存。颜色全部走主题变量 --dsw-alias-*。
+ *
  * 工作方式：
  * - host 半边（src/index.ts）用 installSettingsSection 把配置注册成 settings 命名空间
  *   `dsh-plugin-onebot`（cordis.yml 配置是 composition base 层）；
@@ -9,14 +13,6 @@
  *   命名空间，读取解析值、展示表单、把用户改动写进用户设置文档（revision 防并发）；
  * - host 半边通过 thunk 实时读取命名空间解析值，因此保存后 notify/http 改动立即生效，
  *   WS 连接参数在下次启动时生效。
- *
- * UI 结构参考 harness 内置插件的设置卡片（packages/client/ui-settings-plugins：
- * PluginCard / ValueField / card-form）与 dsh-plugin-template 的 src/client.ts：
- * - 可折叠卡片头：名称 + 描述 + "未保存"徽标 + 展开箭头；
- * - 暂存表单模型：编辑只进草稿，Save 是唯一的写入点，Discard 丢弃草稿，
- *   无效输入阻止保存并在字段下提示；
- * - 三段分组（HTTP 连接 / WS 长连接 / 通知设置），每段可单独"重置"回 composition base 层；
- * - 颜色全部走主题变量（--dsw-alias-*），深浅色自动适配；命名空间不可用时卡片不渲染。
  *
  * 加载契约：与 host 半边同包，经 package.json 的 `dsh.client` 声明 +
  * `exports["./client"]` 被 dsh 的 client-modules 发现，浏览器加载构建产物
@@ -208,6 +204,12 @@ class ConfigForm {
     return this.section(section)[key] === true
   }
 
+  /** 数字字段当前输入是否无效。 */
+  numberInvalid(section: SectionName, key: string): boolean {
+    const spec = this.spec(section, key)
+    return spec.kind === 'number' && !/^\d+$/.test(this.textValue(section, key))
+  }
+
   /** 编辑文本/数字/select 字段。 */
   edit(section: SectionName, key: string, text: string): void {
     const marker = this.marker(section, key)
@@ -238,7 +240,7 @@ class ConfigForm {
     this.publish()
   }
 
-  /** 字段是否被用户覆盖（该 section 在用户层存在即视为覆盖）。 */
+  /** 该 section 是否被用户覆盖（在用户层存在即视为覆盖）。 */
   overridden(section: SectionName): boolean {
     const user = this.scope.getSnapshot().user
     return typeof user === 'object' && user !== null && Object.prototype.hasOwnProperty.call(user, section)
@@ -364,7 +366,7 @@ class ConfigForm {
   }
 }
 
-// ---- 卡片 UI ----
+// ---- 卡片 UI（结构与样式对齐 dsh-plugin-template 的卡片）----
 
 /** 本插件的 settings 命名空间（与 host 半边 ONEBOT_SETTINGS_NAMESPACE 一致）。 */
 const NAMESPACE = 'dsh-plugin-onebot'
@@ -396,7 +398,7 @@ export function apply(ctx: Context): void {
   ))
 }
 
-/** 配置卡片：可折叠头 + 三段表单 + 保存/放弃。命名空间不可用时渲染为空（同内置卡片）。 */
+/** 配置卡片：可折叠头 + 字段列表 + 保存/放弃。命名空间不可用时渲染为空（同内置卡片）。 */
 function ConfigCard({ form }: { form: ConfigForm | undefined }): React.ReactElement | null {
   const [, forceRender] = React.useReducer((count: number) => count + 1, 0)
   React.useEffect(() => (form === undefined ? undefined : form.subscribe(forceRender)), [form])
@@ -440,17 +442,27 @@ function ConfigCard({ form }: { form: ConfigForm | undefined }): React.ReactElem
           'div',
           { className: 'dshob-footer' },
           shell.failed
-            ? React.createElement('p', { className: 'dshob-failed', role: 'status' }, '保存失败，草稿已保留，请重试')
+            ? React.createElement('p', { className: 'dshob-failed', role: 'status' }, '保存失败，草稿已保留，请修正后重试')
             : null,
           React.createElement(
             'button',
-            { type: 'button', className: 'dshob-save', disabled: blocked, onClick: () => { void form.save() } },
-            shell.saving ? '保存中…' : '保存',
+            {
+              type: 'button',
+              className: 'dshob-discard',
+              disabled: !shell.dirty || shell.saving,
+              onClick: () => form.discard(),
+            },
+            '放弃',
           ),
           React.createElement(
             'button',
-            { type: 'button', className: 'dshob-discard', disabled: !shell.dirty && !shell.failed, onClick: () => form.discard() },
-            '放弃',
+            {
+              type: 'button',
+              className: 'dshob-save',
+              disabled: blocked,
+              onClick: () => { void form.save() },
+            },
+            shell.saving ? '保存中…' : '保存',
           ),
         ),
       )
@@ -458,58 +470,65 @@ function ConfigCard({ form }: { form: ConfigForm | undefined }): React.ReactElem
   )
 }
 
-/** 一个分组的渲染：标题 + 重置按钮 + 字段行（含 targets 编辑器）。 */
+/** 一个分组的渲染：分组头（标题 + 已覆盖徽标 + 重置）+ 该组的字段行。 */
 function renderSection(
   form: ConfigForm,
   section: SectionSpec,
   shell: CardShell,
 ): React.ReactElement {
-  const overridden = form.overridden(section.name)
   const children: React.ReactNode[] = [
     React.createElement(
       'div',
-      { className: 'dshob-section-head' },
+      { className: 'dshob-group-head' },
       React.createElement(
         'div',
-        { className: 'dshob-section-title' },
-        React.createElement('span', { className: 'dshob-section-label' }, section.label),
-        React.createElement('span', { className: 'dshob-section-hint' }, section.hint),
+        { className: 'dshob-group-text' },
+        React.createElement('span', { className: 'dshob-group-label' }, section.label),
+        React.createElement('span', { className: 'dshob-group-hint' }, section.hint),
       ),
-      overridden
+      form.overridden(section.name)
         ? React.createElement(
-          'button',
-          {
-            type: 'button',
-            className: 'dshob-reset',
-            disabled: !shell.writable,
-            onClick: () => form.resetSection(section.name),
-          },
-          '重置本节',
+          'span',
+          { className: 'dshob-badges' },
+          React.createElement('span', { className: 'dshob-badge' }, '已覆盖'),
+          React.createElement(
+            'button',
+            {
+              type: 'button',
+              className: 'dshob-reset',
+              disabled: !shell.writable,
+              onClick: () => form.resetSection(section.name),
+            },
+            '重置',
+          ),
         )
         : null,
     ),
   ]
   for (const field of FIELDS) {
     if (field.section !== section.name) continue
-    if (field.key === 'targets') continue
     children.push(renderField(form, field, shell))
   }
   if (section.name === 'notify') children.push(renderTargets(form, shell))
-  return React.createElement('section', { className: 'dshob-section' }, ...children)
+  return React.createElement('section', { className: 'dshob-group' }, ...children)
 }
 
-/** 单个字段行：标签 + 控件 + 提示 + 校验信息。 */
+/** 单个字段行：标签 + 控件 + 提示（与模板 dtpl-field 相同的堆叠结构）。 */
 function renderField(form: ConfigForm, spec: FieldSpec, shell: CardShell): React.ReactElement {
   const id = `dshob-${spec.section}-${spec.key}`
+  const invalid = form.numberInvalid(spec.section, spec.key)
+  const disabled = !shell.writable
+
   let control: React.ReactNode
   if (spec.kind === 'checkbox') {
     control = React.createElement('input', {
       id,
       type: 'checkbox',
       className: 'dshob-checkbox',
-      disabled: !shell.writable,
+      disabled,
       checked: form.boolValue(spec.section, spec.key),
-      onChange: (event: React.ChangeEvent<HTMLInputElement>) => form.toggle(spec.section, spec.key, (event.target as unknown as { checked: boolean }).checked),
+      onChange: (event: React.ChangeEvent<HTMLInputElement>) =>
+        form.toggle(spec.section, spec.key, (event.target as unknown as { checked: boolean }).checked),
     })
   } else if (spec.kind === 'select') {
     control = React.createElement(
@@ -517,9 +536,10 @@ function renderField(form: ConfigForm, spec: FieldSpec, shell: CardShell): React
       {
         id,
         className: 'dshob-input',
-        disabled: !shell.writable,
+        disabled,
         value: form.textValue(spec.section, spec.key),
-        onChange: (event: React.ChangeEvent<HTMLSelectElement>) => form.edit(spec.section, spec.key, (event.target as unknown as { value: string }).value),
+        onChange: (event: React.ChangeEvent<HTMLSelectElement>) =>
+          form.edit(spec.section, spec.key, (event.target as unknown as { value: string }).value),
       },
       (spec.options ?? []).map((option) =>
         React.createElement('option', { key: option.value, value: option.value }, option.label)),
@@ -529,38 +549,46 @@ function renderField(form: ConfigForm, spec: FieldSpec, shell: CardShell): React
       id,
       className: 'dshob-input dshob-textarea',
       rows: 3,
-      disabled: !shell.writable,
+      disabled,
       value: form.textValue(spec.section, spec.key),
-      onChange: (event: React.ChangeEvent<HTMLTextAreaElement>) => form.edit(spec.section, spec.key, (event.target as unknown as { value: string }).value),
+      onChange: (event: React.ChangeEvent<HTMLTextAreaElement>) =>
+        form.edit(spec.section, spec.key, (event.target as unknown as { value: string }).value),
     })
   } else {
     control = React.createElement('input', {
       id,
       type: spec.secret ? 'password' : 'text',
-      className: 'dshob-input',
-      disabled: !shell.writable,
+      className: invalid ? 'dshob-input dshob-input-invalid' : 'dshob-input',
+      ...(spec.kind === 'number' ? { inputMode: 'numeric' as const } : {}),
+      ...(invalid ? { 'aria-invalid': true } : {}),
+      disabled,
       value: form.textValue(spec.section, spec.key),
-      onChange: (event: React.ChangeEvent<HTMLInputElement>) => form.edit(spec.section, spec.key, (event.target as unknown as { value: string }).value),
+      onChange: (event: React.ChangeEvent<HTMLInputElement>) =>
+        form.edit(spec.section, spec.key, (event.target as unknown as { value: string }).value),
     })
   }
 
-  const invalid = spec.kind === 'number' && !/^\d+$/.test(form.textValue(spec.section, spec.key))
-
   return React.createElement(
     'div',
-    { className: invalid ? 'dshob-field dshob-field-invalid' : 'dshob-field' },
-    React.createElement('label', { className: 'dshob-label', htmlFor: id }, spec.label),
+    { className: 'dshob-field' },
+    React.createElement(
+      'div',
+      { className: 'dshob-field-head' },
+      React.createElement('label', { className: 'dshob-label', htmlFor: id }, spec.label),
+    ),
     control,
-    invalid
-      ? React.createElement('p', { className: 'dshob-invalid', role: 'status' }, spec.invalidLabel ?? '输入无效')
-      : null,
-    React.createElement('p', { className: 'dshob-hint' }, spec.hint),
+    React.createElement(
+      'p',
+      { className: invalid ? 'dshob-invalid' : 'dshob-hint' },
+      invalid ? spec.invalidLabel ?? '无效的值' : spec.hint,
+    ),
   )
 }
 
 /** 通知目标列表编辑器：类型 + QQ/群号 + 删除，底部添加。 */
 function renderTargets(form: ConfigForm, shell: CardShell): React.ReactElement {
   const targets = form.targets()
+  const disabled = !shell.writable
   const rows = targets.map((target, index) =>
     React.createElement(
       'div',
@@ -569,7 +597,7 @@ function renderTargets(form: ConfigForm, shell: CardShell): React.ReactElement {
         'select',
         {
           className: 'dshob-input dshob-target-type',
-          disabled: !shell.writable,
+          disabled,
           value: target.type,
           onChange: (event: React.ChangeEvent<HTMLSelectElement>) =>
             form.editTarget(index, 'type', (event.target as unknown as { value: string }).value === 'group' ? 'group' : 'private'),
@@ -581,16 +609,17 @@ function renderTargets(form: ConfigForm, shell: CardShell): React.ReactElement {
         type: 'text',
         className: 'dshob-input dshob-target-id',
         placeholder: 'QQ 号 / 群号',
-        disabled: !shell.writable,
+        disabled,
         value: target.id,
-        onChange: (event: React.ChangeEvent<HTMLInputElement>) => form.editTarget(index, 'id', (event.target as unknown as { value: string }).value),
+        onChange: (event: React.ChangeEvent<HTMLInputElement>) =>
+          form.editTarget(index, 'id', (event.target as unknown as { value: string }).value),
       }),
       React.createElement(
         'button',
         {
           type: 'button',
           className: 'dshob-target-remove',
-          disabled: !shell.writable,
+          disabled,
           onClick: () => form.removeTarget(index),
         },
         '删除',
@@ -600,7 +629,11 @@ function renderTargets(form: ConfigForm, shell: CardShell): React.ReactElement {
   return React.createElement(
     'div',
     { className: 'dshob-field dshob-targets' },
-    React.createElement('span', { className: 'dshob-label' }, '通知目标'),
+    React.createElement(
+      'div',
+      { className: 'dshob-field-head' },
+      React.createElement('span', { className: 'dshob-label' }, '通知目标'),
+    ),
     rows,
     targets.some((target) => target.id.trim() === '')
       ? React.createElement('p', { className: 'dshob-invalid', role: 'status' }, '每个目标的 QQ 号/群号不能为空')
@@ -608,57 +641,119 @@ function renderTargets(form: ConfigForm, shell: CardShell): React.ReactElement {
     React.createElement('p', { className: 'dshob-hint' }, '任务完成时通知这些私聊/群组；留空则只依赖 notify_onebot 工具显式指定目标。'),
     React.createElement(
       'button',
-      { type: 'button', className: 'dshob-target-add', disabled: !shell.writable, onClick: () => form.addTarget() },
+      { type: 'button', className: 'dshob-target-add', disabled, onClick: () => form.addTarget() },
       '+ 添加目标',
     ),
   )
 }
 
-// ---- 样式 ----
+// ---- 样式：对齐 dsh-plugin-template 卡片（class 前缀 dshob-，颜色全走主题变量）----
+
+let stylesInjected = false
 
 function injectStyles(): void {
+  if (stylesInjected || typeof document === 'undefined') return
+  stylesInjected = true
   const tag = document.createElement('style')
   tag.dataset.dshob = 'true'
+  tag.dataset.pluginCss = `${NAMESPACE}/card`
   tag.textContent = `
-.dshob-card { list-style: none; margin: 0; border: 1px solid var(--dsw-alias-border-l2); border-radius: 10px; background: var(--dsw-alias-bg-layer-2); }
-.dshob-card-open { border-color: var(--dsw-alias-border-l3); }
-.dshob-header { display: flex; align-items: center; gap: 8px; width: 100%; padding: 10px 12px; border: 0; background: none; cursor: pointer; text-align: left; font: inherit; color: var(--dsw-alias-label-primary); }
-.dshob-head-text { display: flex; flex-direction: column; gap: 2px; flex: 1; min-width: 0; }
-.dshob-name { font-size: 13px; font-weight: 600; }
-.dshob-description { font-size: 12px; color: var(--dsw-alias-label-tertiary); }
-.dshob-pending { font-size: 11px; color: var(--dsw-alias-warning-primary, #b8860b); border: 1px solid currentColor; border-radius: 999px; padding: 1px 8px; }
-.dshob-chevron { width: 0; height: 0; border-left: 5px solid transparent; border-right: 5px solid transparent; border-top: 6px solid var(--dsw-alias-label-tertiary); transition: transform .15s; }
-.dshob-chevron-open { transform: rotate(180deg); }
-.dshob-body { padding: 0 12px 12px; display: flex; flex-direction: column; gap: 12px; }
-.dshob-read-only, .dshob-failed { margin: 0; font-size: 12px; color: var(--dsw-alias-state-error-primary); }
-.dshob-section { display: flex; flex-direction: column; gap: 8px; padding: 10px; border: 1px solid var(--dsw-alias-border-l2); border-radius: 8px; }
-.dshob-section-head { display: flex; align-items: center; justify-content: space-between; gap: 8px; }
-.dshob-section-title { display: flex; flex-direction: column; gap: 2px; }
-.dshob-section-label { font-size: 13px; font-weight: 600; color: var(--dsw-alias-label-primary); }
-.dshob-section-hint { font-size: 12px; color: var(--dsw-alias-label-tertiary); }
-.dshob-reset { font-size: 12px; color: var(--dsw-alias-brand-primary); background: none; border: 0; cursor: pointer; padding: 2px 4px; }
-.dshob-field { display: grid; grid-template-columns: 150px 1fr; gap: 4px 10px; align-items: center; }
-.dshob-field-invalid { grid-template-columns: 150px 1fr; }
-.dshob-label { font-size: 12px; color: var(--dsw-alias-label-secondary); }
-.dshob-input { height: 34px; padding: 0 12px; border: 1px solid var(--dsw-alias-border-l2); border-radius: 8px; background: var(--dsw-alias-bg-layer-3); font: inherit; font-size: 13px; line-height: 1.5; color: var(--dsw-alias-label-primary); }
+.dshob-card {
+  list-style: none;
+  border: 1px solid var(--dsw-alias-border-l2);
+  border-radius: 12px;
+  background: var(--dsw-alias-bg-layer-3);
+  transition: border-color .16s, background .16s;
+}
+.dshob-card:hover { border-color: var(--dsw-alias-label-dimmed); }
+.dshob-card-open { background: var(--dsw-alias-bg-layer-2); border-color: var(--dsw-alias-label-dimmed); }
+.dshob-header {
+  width: 100%; appearance: none; border: 0; background: none; font: inherit;
+  color: inherit; text-align: left; cursor: pointer;
+  display: flex; align-items: center; gap: 12px;
+  padding: 14px 16px; border-radius: 12px;
+}
+.dshob-header:focus-visible { outline: 2px solid var(--dsw-alias-brand-primary); outline-offset: -2px; }
+.dshob-head-text { flex: 1; min-width: 0; display: flex; flex-direction: column; gap: 4px; }
+.dshob-name { font-size: 15px; font-weight: 600; line-height: 1.4; color: var(--dsw-alias-label-primary); }
+.dshob-description { font-size: 13px; line-height: 1.5; color: var(--dsw-alias-label-tertiary); }
+.dshob-chevron {
+  flex: none; color: var(--dsw-alias-label-tertiary); transition: transform .16s;
+  width: 8px; height: 8px; border-right: 1.5px solid currentColor; border-bottom: 1.5px solid currentColor;
+  transform: rotate(45deg); margin: -3px 4px 0 0;
+}
+.dshob-chevron-open { transform: rotate(225deg); }
+.dshob-body { border-top: 1px solid var(--dsw-alias-border-l2); margin: 0 16px; padding-bottom: 8px; }
+.dshob-read-only { margin: 12px 0 0; font-size: 12px; line-height: 1.5; color: var(--dsw-alias-label-tertiary); }
+.dshob-pending {
+  flex: none; border-radius: 999px; padding: 1px 8px; font-size: 11px; line-height: 17px;
+  font-weight: 500; white-space: nowrap;
+  background: var(--dsw-alias-bg-module-platform); color: var(--dsw-alias-label-secondary);
+}
+.dshob-footer {
+  display: flex; align-items: center; justify-content: flex-end; gap: 8px;
+  padding: 12px 0 4px; border-top: 1px solid var(--dsw-alias-border-l2);
+}
+.dshob-failed { flex: 1; min-width: 0; margin: 0; font-size: 12px; line-height: 1.5; color: var(--dsw-alias-state-error-primary); }
+.dshob-discard, .dshob-save {
+  appearance: none; border: 1px solid transparent; border-radius: 8px;
+  padding: 5px 14px; font: inherit; font-size: 13px; line-height: 1.5; cursor: pointer;
+}
+.dshob-discard { border-color: var(--dsw-alias-border-l2); background: none; color: var(--dsw-alias-label-secondary); }
+.dshob-discard:hover:not(:disabled) { color: var(--dsw-alias-label-primary); border-color: var(--dsw-alias-label-dimmed); }
+.dshob-save { background: var(--dsw-alias-label-primary); color: var(--dsw-alias-bg-layer-3); }
+.dshob-discard:disabled, .dshob-save:disabled { opacity: 0.4; cursor: default; }
+.dshob-discard:focus-visible, .dshob-save:focus-visible { outline: 2px solid var(--dsw-alias-brand-primary); outline-offset: 1px; }
+.dshob-group { padding: 4px 0 0; }
+.dshob-group-head {
+  display: flex; align-items: center; gap: 8px;
+  padding: 14px 0 4px; border-top: 1px solid var(--dsw-alias-border-l2);
+}
+.dshob-group:first-child .dshob-group-head { border-top: 0; }
+.dshob-group-text { flex: 1; min-width: 0; display: flex; flex-direction: column; gap: 2px; }
+.dshob-group-label { font-size: 13px; font-weight: 600; line-height: 1.5; color: var(--dsw-alias-label-primary); }
+.dshob-group-hint { font-size: 12px; line-height: 1.5; color: var(--dsw-alias-label-tertiary); }
+.dshob-badges { display: inline-flex; align-items: center; gap: 8px; }
+.dshob-badge {
+  border-radius: 999px; padding: 1px 8px; font-size: 11px; line-height: 17px; white-space: nowrap; font-weight: 500;
+  background: var(--dsw-alias-bg-module-platform); color: var(--dsw-alias-label-secondary);
+}
+.dshob-reset { border: none; background: none; padding: 0; font: inherit; font-size: 12px; line-height: 1.5; color: var(--dsw-alias-label-secondary); cursor: pointer; }
+.dshob-reset:hover:not(:disabled) { color: var(--dsw-alias-label-primary); }
+.dshob-reset:disabled { cursor: default; }
+.dshob-field { display: flex; flex-direction: column; gap: 6px; padding: 12px 0; }
+.dshob-field + .dshob-field { border-top: 1px solid var(--dsw-alias-border-l2); }
+.dshob-field-head { display: flex; align-items: center; gap: 8px; }
+.dshob-label { flex: 1; min-width: 0; font-size: 13px; font-weight: 500; line-height: 1.5; color: var(--dsw-alias-label-primary); }
+.dshob-input {
+  height: 34px; padding: 0 12px; border: 1px solid var(--dsw-alias-border-l2); border-radius: 8px;
+  background: var(--dsw-alias-bg-layer-3); font: inherit; font-size: 13px; line-height: 1.5;
+  color: var(--dsw-alias-label-primary);
+}
 .dshob-input:focus-visible { outline: none; border-color: var(--dsw-alias-brand-primary); }
 .dshob-input:disabled { color: var(--dsw-alias-label-tertiary); cursor: default; }
-.dshob-textarea { height: auto; min-height: 64px; padding: 8px 12px; resize: vertical; }
-.dshob-checkbox { width: 16px; height: 16px; accent-color: var(--dsw-alias-brand-primary); justify-self: start; }
-.dshob-invalid { grid-column: 2; margin: 0; font-size: 12px; color: var(--dsw-alias-state-error-primary); }
-.dshob-hint { grid-column: 2; margin: 0; font-size: 12px; color: var(--dsw-alias-label-tertiary); }
-.dshob-targets { display: flex; flex-direction: column; align-items: stretch; gap: 6px; }
-.dshob-targets .dshob-label, .dshob-targets .dshob-hint, .dshob-targets .dshob-invalid { grid-column: auto; }
-.dshob-target-row { display: flex; gap: 8px; }
-.dshob-target-type { width: 110px; }
-.dshob-target-id { flex: 1; }
-.dshob-target-remove, .dshob-target-add { font-size: 12px; color: var(--dsw-alias-label-secondary); background: var(--dsw-alias-bg-layer-3); border: 1px solid var(--dsw-alias-border-l2); border-radius: 8px; padding: 4px 10px; cursor: pointer; }
-.dshob-target-remove:hover, .dshob-target-add:hover { border-color: var(--dsw-alias-brand-primary); color: var(--dsw-alias-brand-primary); }
-.dshob-footer { display: flex; gap: 8px; align-items: center; }
-.dshob-save, .dshob-discard { font-size: 13px; border-radius: 8px; padding: 6px 16px; cursor: pointer; }
-.dshob-save { background: var(--dsw-alias-brand-primary); color: #fff; border: 0; }
-.dshob-save:disabled { opacity: .5; cursor: default; }
-.dshob-discard { background: none; border: 1px solid var(--dsw-alias-border-l2); color: var(--dsw-alias-label-secondary); }
+.dshob-input-invalid { border-color: var(--dsw-alias-state-error-primary); }
+.dshob-textarea { height: auto; min-height: 68px; padding: 8px 12px; resize: vertical; }
+.dshob-checkbox { width: 16px; height: 16px; accent-color: var(--dsw-alias-brand-primary); }
+.dshob-invalid { margin: 0; font-size: 12px; line-height: 1.5; color: var(--dsw-alias-state-error-primary); }
+.dshob-hint { margin: 0; font-size: 12px; line-height: 1.5; color: var(--dsw-alias-label-tertiary); }
+.dshob-targets { gap: 8px; }
+.dshob-target-row { display: flex; gap: 8px; align-items: center; }
+.dshob-target-type { width: 110px; flex: none; }
+.dshob-target-id { flex: 1; min-width: 0; }
+.dshob-target-remove {
+  flex: none; border: none; background: none; padding: 0 4px; font: inherit;
+  font-size: 12px; line-height: 1.5; color: var(--dsw-alias-label-secondary); cursor: pointer;
+}
+.dshob-target-remove:hover:not(:disabled) { color: var(--dsw-alias-state-error-primary); }
+.dshob-target-remove:disabled { cursor: default; }
+.dshob-target-add {
+  align-self: flex-start; appearance: none; border: 1px solid var(--dsw-alias-border-l2); border-radius: 8px;
+  padding: 5px 14px; font: inherit; font-size: 13px; line-height: 1.5; cursor: pointer;
+  background: none; color: var(--dsw-alias-label-secondary);
+}
+.dshob-target-add:hover:not(:disabled) { color: var(--dsw-alias-label-primary); border-color: var(--dsw-alias-label-dimmed); }
+.dshob-target-add:disabled { opacity: 0.4; cursor: default; }
 `
   document.head.appendChild(tag)
 }
