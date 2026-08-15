@@ -16,6 +16,24 @@ DeepSeek Harness（`dsh`）插件：**任务完成后，通过 OneBot（NapCat /
 - 以 Service（`ctx.onebot`）形式提供，其他插件可复用。
 - **GUI 配置页**：Web UI「设置 → 插件 → Configurable」里可直接编辑全部配置（HTTP / WS / 通知目标），保存即写入 `settings.yaml`，notify/http 改动即时生效。
 
+## 目录结构
+
+```
+dsh-plugin-onebot/
+├── package.json        # npm 包清单 + dsh.bundle / dsh.client 声明 + prepare 构建脚本
+├── tsconfig.json       # 严格模式类型检查配置（tsc --noEmit）
+├── tsdown.config.ts    # 构建配置：Node 库（lib/）+ 浏览器 client bundle（lib/client.js）
+├── cordis.patch.yml    # bundle 配置层：插入插件行
+├── dev/cordis.yml      # 本地开发 overlay（只加载 host 半边，见「本地开发」）
+├── src/
+│   ├── index.ts        # 主插件：Config schema + settings 命名空间 + 事件监听 + 工具
+│   ├── service.ts      # OneBotService（ctx.onebot）：WS 长连接 + HTTP 行为
+│   ├── client.ts       # 浏览器半边：设置页里的可点击配置卡片（settings.plugin.item 插槽）
+│   ├── notify.ts       # 摘要提取 / 模板渲染 / 截断（对外最小结构类型）
+│   └── types.ts        # 配置类型
+└── test/smoke.mjs      # 冒烟测试（含 settings 接线单测）
+```
+
 ## 架构
 
 ```mermaid
@@ -48,15 +66,26 @@ dsh --profile demo --dump-config   # 应看到 "# == dsh-plugin-onebot" 层
 dsh --profile demo
 ```
 
+> 想看/编辑 GUI 配置卡片，需要安装进带完整界面的 `web` profile（`dsh plugin --profile web add ...`），见「配置页（GUI 设置）」。
+
 ## NapCat 配置
 
-在 NapCat WebUI 的「网络配置」中：
+在 NapCat WebUI 的「网络配置」中，按你选定的 `ws.mode` 配置其中一套（HTTP 服务器两者都要开）：
 
-1. **HTTP 服务器**：开启。默认端口 `3000`（与插件 `http.url` 保持一致）。若设置了 token，记下来填到插件 `http.token`。
-2. **WebSocket 客户端（反向 WS）**：新建一条，类型选「WebSocket 客户端 / 反向 WebSocket 客户端」：
-   - 地址：`ws://<dsh 所在机器 IP>:8080/ws`（与插件 `ws.port` / `ws.path` 保持一致；dsh 与 NapCat 同机可用 `127.0.0.1`）
-   - token：与插件 `ws.token` 保持一致（留空则都不鉴权）
-   - 保存并启用后，日志应显示「反向 WebSocket 已连接」；插件侧 `verbose: true` 时也会打印 `WS client connected`。
+### 方式 A：`ws.mode: client` —— 插件连 NapCat 正向 WS（NapCat 是 WebSocket Server）
+
+1. **HTTP 服务器**：开启，端口如 `3000`（与插件 `http.url` 一致）；token 填到插件 `http.token`。
+2. **WebSocket 服务器（正向 WS）**：新建一条，端口如 `3001`（与插件 `ws.port` 一致）；token 填到插件 `ws.token`。
+   - 插件以 `client` 模式主动连接 `ws://<NapCat 机器 IP>:3001/ws`（`ws.host` / `ws.path` 保持一致，同机可用 `127.0.0.1`）。
+   - 连接成功后插件日志（`verbose: true`）显示 `WS connected to ...`，并会收到 NapCat 的 `lifecycle/connect` 事件。
+
+### 方式 B：`ws.mode: server` —— 插件做 WS 服务端，等 NapCat 反向 WS 连入（默认）
+
+1. **HTTP 服务器**：同上。
+2. **WebSocket 客户端（反向 WS）**：新建一条，地址填 `ws://<dsh 所在机器 IP>:8080/ws`（与插件 `ws.port` / `ws.path` 一致；dsh 与 NapCat 同机可用 `127.0.0.1`）；token 与插件 `ws.token` 一致。
+   - 连接成功后插件日志显示 `WS client connected`。
+
+> 两种方式任选其一即可；HTTP 行为（发消息）始终走 HTTP API，与 WS 方向无关。
 
 ## dsh 配置
 
@@ -157,6 +186,17 @@ pnpm dsh web --patch /absolute/path/to/dsh-plugin-onebot/dev/cordis.yml
 ```
 
 （`dev/cordis.yml` 里的 `name` 是绝对路径，需改成你机器上的实际路径。）
+
+> ⚠️ `--patch` overlay 只加载 **host 半边**（模块解析到源码文件，发现不了包级的
+> `dsh.client` 声明），所以配置卡片不会出现。要测试浏览器半边的卡片，必须把包按
+> **包名**安装进带 GUI 的 `web` profile：
+
+```sh
+pnpm dsh plugin --profile web add /absolute/path/to/dsh-plugin-onebot && pnpm dsh web
+```
+
+> 并且要确保 harness 的 `WEB_SETTINGS_NAMESPACES` 白名单里有 `dsh-plugin-onebot`
+> （见「配置页（GUI 设置）」），否则卡片不渲染。
 
 ## 发布
 
