@@ -84,6 +84,8 @@ export class OneBotService extends Service {
   /** WS 长连接是否已建立（server 模式有接入方 / client 模式已连上）。 */
   connected = false
 
+  private readonly configSource: () => OneBotServiceConfig
+
   private wss: WebSocketServer | undefined
   private client: WebSocket | undefined
   private reconnectTimer: ReturnType<typeof setTimeout> | undefined
@@ -92,8 +94,14 @@ export class OneBotService extends Service {
   private readonly eventHandlers = new Set<(event: OneBotEvent) => void>()
   private readonly statusHandlers = new Set<(connected: boolean) => void>()
 
-  constructor(ctx: Context, private readonly config: OneBotServiceConfig) {
+  constructor(ctx: Context, config: OneBotServiceConfig | (() => OneBotServiceConfig)) {
     super(ctx, 'onebot')
+    this.configSource = typeof config === 'function' ? config : () => config
+  }
+
+  /** 当前生效配置：每次读取都走访问器，UI 设置页改动后无需重建服务即可生效。 */
+  private get config(): OneBotServiceConfig {
+    return this.configSource()
   }
 
   private get verbose(): boolean {

@@ -1,10 +1,11 @@
 // 冒烟测试：验证主插件注册 notify_onebot 工具、任务完成自动通知（agent/status idle）、
-// OneBotService 的 HTTP 发送与 WS server 长连接（心跳事件接收）。
+// OneBotService 的 HTTP 发送与 WS server 长连接（心跳事件接收）、
+// 以及 dsh-settings 配置页注册与「设置改动即时生效」。
 // 运行：node test/smoke.mjs（先 pnpm build）
 import assert from 'node:assert/strict'
 import { createServer } from 'node:http'
 import WebSocket from 'ws'
-import { name, inject, apply } from '../lib/index.js'
+import { name, inject, apply, ONEBOT_SETTINGS_NAMESPACE } from '../lib/index.js'
 import { OneBotService, OneBotHttpError } from '../lib/service.js'
 import { renderTemplate, truncate, extractAssistantText } from '../lib/index.js'
 
@@ -44,11 +45,33 @@ const config = {
   },
 }
 
-// ---------- 3) 最小可用 ctx ----------
+// ---------- 3) 最小可用 ctx（含 settings 服务桩） ----------
+// settingsValue 模拟「设置页保存后的 resolved 配置」，apply 之后可原地修改以验证即时生效。
+let settingsValue = structuredClone(config)
+let registeredNs
+let registeredSchema
+const settingsProvider = {
+  register(ns, schema) {
+    registeredNs = ns
+    registeredSchema = schema
+    return {
+      get: () => settingsValue,
+      watch: () => () => {},
+      update: async () => {},
+      replace: async () => {},
+    }
+  },
+}
+const settingsCtx = {
+  settings: settingsProvider,
+  effect: (fn) => fn(),
+}
+
 const listeners = new Map()
 const registered = []
 const effects = []
 const ctx = {
+  fiber: { state: 0 },
   tools: { register(definition) { registered.push(definition) } },
   reflect: { provide() { return () => {} } },
   on(event, fn) {
@@ -60,12 +83,18 @@ const ctx = {
     effects.push(disposer)
     return disposer
   },
+  inject(deps, callback) {
+    if (deps.includes('settings')) return callback(settingsCtx)
+    return undefined
+  },
 }
 
 apply(ctx, config)
 
 assert.equal(name, 'dsh-plugin-onebot')
 assert.deepEqual(inject, ['tools'])
+assert.equal(registeredNs, ONEBOT_SETTINGS_NAMESPACE, 'settings namespace should be registered')
+assert.ok(registeredSchema, 'settings schema should be registered')
 
 // ---------- 4) 工具注册 + 执行（指定目标） ----------
 const tool = registered.find((t) => t.name === 'notify_onebot')
@@ -126,7 +155,40 @@ statusListener({ agent: fakeAgent, status: 'idle' })
 await new Promise((r) => setTimeout(r, 30))
 assert.equal(received.length, before + 2, 'no duplicate notification without running transition')
 
-// ---------- 6) OneBotService 直接 HTTP 调用 ----------
+// ---------- 6) 设置页改配置 → 即时生效 ----------
+const beforeLive = received.length
+settingsValue.notify.targets = [{ type: 'group', id: '55555' }]
+settingsValue.notify.template = 'LIVE:{summary}'
+statusListener({ agent: fakeAgent, status: 'running' })
+statusListener({ agent: fakeAgent, status: 'idle' })
+await new Promise((r) => setTimeout(r, 50))
+const live = received.slice(beforeLive)
+assert.equal(live.length, 1, 'new target from settings should be used')
+assert.equal(live[0].action, '/send_group_msg')
+assert.equal(live[0].body.group_id, 55555)
+assert.match(live[0].body.message, /^LIVE:任务完成啦$/, 'template from settings should apply')
+
+// notifyOn 切换为 turn：agent/status idle 不再通知，turn/end 才通知
+const beforeTurn = received.length
+settingsValue.notify.notifyOn = 'turn'
+settingsValue.notify.targets = [{ type: 'private', id: '10001' }]
+settingsValue.notify.template = 'TURN:{sessionId}:{summary}'
+statusListener({ agent: fakeAgent, status: 'running' })
+statusListener({ agent: fakeAgent, status: 'idle' })
+await new Promise((r) => setTimeout(r, 30))
+assert.equal(received.length, beforeTurn, 'idle listener should be inactive in turn mode')
+
+const sessionListener = listeners.get('session/event')
+assert.ok(sessionListener, 'session/event listener should be registered')
+sessionListener(fakeSession, { type: 'turn/end', seq: 2, time: 3, data: { turn: 1, reason: { kind: 'completed' } } })
+await new Promise((r) => setTimeout(r, 50))
+const turnSent = received.slice(beforeTurn)
+assert.equal(turnSent.length, 1, 'turn/end completed should notify in turn mode')
+assert.equal(turnSent[0].action, '/send_private_msg')
+assert.equal(turnSent[0].body.user_id, 10001)
+assert.match(turnSent[0].body.message, /^TURN:sess-1:任务完成啦$/)
+
+// ---------- 7) OneBotService 直接 HTTP 调用 ----------
 const service = new OneBotService(ctx, config)
 const res = await service.sendGroupMsg('40004', '群消息', true)
 assert.equal(res.retcode, 0)
@@ -149,10 +211,9 @@ try {
 }
 assert.ok(threw, 'HTTP failure should throw OneBotHttpError')
 
-// ---------- 7) WS server 长连接 ----------
+// ---------- 8) WS server 长连接 ----------
 const wsConfig = {
   ...config,
-  http: { ...config.http },
   ws: { mode: 'server', host: '127.0.0.1', port: 0, path: '/ws', token: '', reconnectInterval: 500 },
 }
 const wsService = new OneBotService(ctx, wsConfig)
@@ -185,7 +246,7 @@ wsService.stop()
 assert.equal(wsService.connected, false)
 client.close()
 
-// ---------- 8) 通知辅助函数 ----------
+// ---------- 9) 通知辅助函数 ----------
 assert.equal(truncate('123456', 5), '1234…')
 assert.equal(truncate('123', 5), '123')
 assert.match(

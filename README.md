@@ -14,6 +14,7 @@ DeepSeek Harness（`dsh`）插件：**任务完成后，通过 OneBot（NapCat /
 - 通知模板：支持 `{sessionId}` `{summary}` `{status}` `{time}` 占位符；摘要自动取最后一条 assistant 文本并按 `maxLength` 截断。
 - 模型可主动调用 `notify_onebot` 工具，把结果推给指定用户/群，支持 CQ 码（如 `[CQ:at,qq=123]`）。
 - 以 Service（`ctx.onebot`）形式提供，其他插件可复用。
+- **GUI 配置页**：Web UI「设置 → 插件 → Configurable」里可直接编辑全部配置（HTTP / WS / 通知目标），保存即写入 `settings.yaml`，notify/http 改动即时生效。
 
 ## 架构
 
@@ -92,6 +93,39 @@ plugins:
 ```
 
 > 注意：`targets` 为空时自动通知会跳过（避免误发），但 `notify_onebot` 工具仍可用显式 `targetId` 发送。
+
+## 配置页（GUI 设置）
+
+配置已接线到 dsh 的 settings 命名空间 `dsh-plugin-onebot`（host 半边 `src/index.ts` 用
+`installSettingsSection` 注册，浏览器半边 `src/client.ts` 在 `settings.plugin.item` 插槽渲染卡片）。
+在 Web GUI（`dsh web`，默认 `http://127.0.0.1:3080`）左下角 **设置 → 插件 → Configurable**，
+应看到一张 `dsh-plugin-onebot` 卡片，分三段：
+
+- **HTTP 连接**：`url` / `token` / `timeoutMs`
+- **WS 长连接**：`mode` / `host` / `port` / `path` / `token` / `reconnectInterval`
+- **通知设置**：`notifyOn` / 消息模板 / 长度限制 / 重试 / 通知目标列表（可增删私聊/群聊）
+
+保存后：
+
+- `notify.*` 与 `http.*` 改动**即时生效**（host 通过配置 thunk 实时读取）；
+- `ws.*` 连接参数在**下次启动**时生效（避免频繁断连重连）；
+- 想恢复某个分段的默认值，点该段标题右侧的「重置本节」。
+
+> ⚠️ **harness 一次性设置（必读）**：卡片能否显示还取决于 harness 的
+> `packages/host/apiproxy/src/api-proxy.ts` 里 `WEB_SETTINGS_NAMESPACES` 白名单——
+> 不在名单里的命名空间，即使插件注册了，`settings.describe` 也会当它"not exposed"，
+> 卡片因此不渲染。需要在你的 harness 检出里加一行：
+
+```ts
+const WEB_SETTINGS_NAMESPACES = [
+  'agent-loop', 'shell', 'locale', 'permission', 'ui-conversation', 'ui-theme', 'web-search-deepseek',
+  'dsh-plugin-template', 'dsh-plugin-onebot',   // ← 加 dsh-plugin-onebot
+] as const
+```
+
+> 这是 harness 当前的注册决策点，更新/重装 harness 检出新代码后会丢失，需要重新加。
+> 另外 client 半边只在插件以**包名**安装进 profile 时加载（`dsh plugin --profile web add ...`），
+> `--patch` 源码路径挂载不会加载配置卡片。
 
 ## notify_onebot 工具
 
